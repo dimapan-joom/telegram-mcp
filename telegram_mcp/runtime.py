@@ -111,8 +111,33 @@ def get_entity_filter_type(entity: Any) -> Optional[str]:
 
 load_dotenv()
 
-TELEGRAM_API_ID = int(os.getenv("TELEGRAM_API_ID"))
-TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH")
+CREDENTIALS_HELP = (
+    "Get them at https://my.telegram.org/apps, then set them in the environment "
+    "or in a .env file next to the server."
+)
+
+
+def _require_api_id(raw: Optional[str]) -> int:
+    """Validate TELEGRAM_API_ID at import time with an actionable message."""
+    if not raw:
+        raise RuntimeError(f"TELEGRAM_API_ID is not set. {CREDENTIALS_HELP}")
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"TELEGRAM_API_ID must be an integer, got {raw!r}. {CREDENTIALS_HELP}"
+        ) from exc
+
+
+def _require_api_hash(raw: Optional[str]) -> str:
+    """Validate TELEGRAM_API_HASH at import time with an actionable message."""
+    if not raw:
+        raise RuntimeError(f"TELEGRAM_API_HASH is not set. {CREDENTIALS_HELP}")
+    return raw
+
+
+TELEGRAM_API_ID = _require_api_id(os.getenv("TELEGRAM_API_ID"))
+TELEGRAM_API_HASH = _require_api_hash(os.getenv("TELEGRAM_API_HASH"))
 
 # The shared HTTP service can be consumed by long-lived MCP clients. Stateless requests keep
 # those clients usable across server-process restarts instead of rejecting their next call
