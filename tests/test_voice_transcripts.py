@@ -370,6 +370,7 @@ async def test_transcribe_voice_rejects_unknown_engine(monkeypatch, transcript_c
 @pytest.mark.asyncio
 async def test_transcribe_voice_groq_without_api_key(monkeypatch, transcript_cache_dir):
     monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    monkeypatch.delenv("LITELLM_API_KEY", raising=False)
     monkeypatch.setenv("TELEGRAM_TRANSCRIBE", "on-demand")
     entity = SimpleNamespace()
     client = _FakeClient(messages_by_id={5: _voice_msg(id=5)})

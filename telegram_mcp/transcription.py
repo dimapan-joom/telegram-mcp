@@ -35,7 +35,7 @@ from telegram_mcp.runtime import account_is_premium, get_marked_id, is_premium_r
 # ---------------------------------------------------------------------------
 
 _TRANSCRIBE_MODES = {"off", "on-demand", "auto"}
-ENGINES = {"telegram", "groq"}
+ENGINES = {"telegram", "groq", "litellm"}
 
 GROQ_TRANSCRIBE_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 GROQ_MODEL = "whisper-large-v3-turbo"
@@ -128,14 +128,32 @@ def _too_large_for_groq(size: int, limit: int) -> dict:
 
 
 def cache_dir() -> Path:
-    raw = os.getenv("TELEGRAM_TRANSCRIPT_CACHE_DIR", "data/transcripts")
-    d = Path(raw)
-    d.mkdir(parents=True, exist_ok=True)
-    try:
-        os.chmod(d, 0o700)
-    except OSError:
-        pass
-    return d
+    """A directory this process can create.
+
+    The broker image is read-only and its working directory is not /data, so
+    the old relative default (data/transcripts) raised before either engine
+    ran. Every voice then came back as the same masked error.
+    """
+    configured = os.getenv("TELEGRAM_TRANSCRIPT_CACHE_DIR", "").strip()
+    if configured:
+        candidates = [Path(configured)]
+    else:
+        candidates = [
+            Path("/data/telegram-transcripts"),
+            Path("/tmp/telegram-transcripts"),
+        ]
+    last_error = None
+    for path in candidates:
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            try:
+                os.chmod(path, 0o700)
+            except OSError:
+                pass
+            return path
+        except OSError as exc:
+            last_error = exc
+    raise RuntimeError("transcript cache directory is not writable") from last_error
 
 
 def _cache_db_path() -> Path:
@@ -208,7 +226,10 @@ def get_cached_transcript(
     display whatever exists (listings, backfill skip checks) pass None and get
     the default engine's row when there is one, any row otherwise.
     """
-    conn = _connect()
+    try:
+        conn = _connect()
+    except (OSError, sqlite3.Error):
+        return None
     try:
         if source is not None:
             row = conn.execute(
@@ -246,7 +267,10 @@ def save_transcript(
     duration: Optional[int] = None,
     lang: Optional[str] = None,
 ) -> None:
-    conn = _connect()
+    try:
+        conn = _connect()
+    except (OSError, sqlite3.Error):
+        return
     try:
         conn.execute(
             "INSERT OR REPLACE INTO transcripts "
@@ -386,6 +410,60 @@ async def _transcribe_via_groq(cl, msg) -> dict:
     return {"status": "ok", "text": text, "lang": payload.get("language")}
 
 
+async def _transcribe_via_litellm(cl, msg) -> dict:
+    """OpenAI-compatible transcription through the LiteLLM proxy already used
+    for the assistant's own voice notes. Audio is held in memory only."""
+    api_key = os.getenv("LITELLM_API_KEY", "").strip()
+    if not api_key:
+        return {"status": "error", "error": "LITELLM_API_KEY is not configured"}
+
+    base = os.getenv("LITELLM_BASE_URL", "https://litellm.joom.it/v1").strip().rstrip("/")
+    model = os.getenv("LITELLM_TRANSCRIBE_MODEL", "openai/gpt-4o-transcribe").strip()
+    limit = groq_max_upload_bytes()
+    declared = getattr(getattr(msg, "file", None), "size", None)
+    if isinstance(declared, int) and declared > limit:
+        return _too_large_for_groq(declared, limit)
+
+    try:
+        data = await cl.download_media(msg, file=bytes)
+    except Exception as e:
+        return {"status": "error", "error": f"download failed: {e}"}
+    if not data:
+        return {"status": "error", "error": "empty media download"}
+    if len(data) > limit:
+        size = len(data)
+        del data
+        return _too_large_for_groq(size, limit)
+
+    file_attr = getattr(msg, "file", None)
+    ext = (getattr(file_attr, "ext", None) or ".oga").lstrip(".")
+    mime = getattr(file_attr, "mime_type", None) or "audio/ogg"
+
+    try:
+        async with httpx.AsyncClient(timeout=90.0) as client:
+            resp = await client.post(
+                base + "/audio/transcriptions",
+                headers={"Authorization": f"Bearer {api_key}"},
+                data={
+                    "model": model,
+                    "response_format": "json",
+                    "prompt": "Telegram voice note. Russian, Portuguese, or English.",
+                },
+                files={"file": (f"voice.{ext}", bytes(data), mime)},
+            )
+        resp.raise_for_status()
+        payload = resp.json()
+    except Exception as e:
+        return {"status": "error", "error": f"litellm request failed: {e}"}
+    finally:
+        del data
+
+    text = (payload.get("text") or "").strip()
+    if not text:
+        return {"status": "error", "error": "empty transcript"}
+    return {"status": "ok", "text": text, "lang": payload.get("language")}
+
+
 async def transcribe(cl, entity, msg, engine: str) -> dict:
     """Dispatch to one engine. Returns a status dict:
     {"status": "ok", "text": ..., "lang": ...} |
@@ -396,6 +474,8 @@ async def transcribe(cl, entity, msg, engine: str) -> dict:
         return await _transcribe_via_telegram(cl, entity, msg)
     if engine == "groq":
         return await _transcribe_via_groq(cl, msg)
+    if engine == "litellm":
+        return await _transcribe_via_litellm(cl, msg)
     return {"status": "error", "error": f"Unknown engine '{engine}'"}
 
 
@@ -507,9 +587,10 @@ class TranscribeBudget:
         self.used_seconds = 0
 
     def can_afford(self, duration: Optional[int]) -> bool:
-        if self.used_voices >= self.max_voices:
+        # 0 means no cap. Explicit transcribe_voice never consults this.
+        if self.max_voices > 0 and self.used_voices >= self.max_voices:
             return False
-        if self.used_seconds + (duration or 0) > self.max_seconds:
+        if self.max_seconds > 0 and self.used_seconds + (duration or 0) > self.max_seconds:
             return False
         return True
 
@@ -519,17 +600,19 @@ class TranscribeBudget:
 
 
 def _max_voices_env() -> int:
+    # 0 is unlimited. A missing value used to mean 5, which stopped a long
+    # chat from being transcribed in auto mode.
     try:
-        return int(os.getenv("TELEGRAM_TRANSCRIBE_MAX_VOICES", "5"))
+        return max(0, int(os.getenv("TELEGRAM_TRANSCRIBE_MAX_VOICES", "0")))
     except ValueError:
-        return 5
+        return 0
 
 
 def _max_seconds_env() -> int:
     try:
-        return int(os.getenv("TELEGRAM_TRANSCRIBE_MAX_SECONDS", "300"))
+        return max(0, int(os.getenv("TELEGRAM_TRANSCRIBE_MAX_SECONDS", "0")))
     except ValueError:
-        return 300
+        return 0
 
 
 async def prefetch_transcripts(cl, entity, chat_id: int, messages) -> None:
