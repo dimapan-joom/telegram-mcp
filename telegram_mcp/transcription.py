@@ -436,8 +436,12 @@ async def _transcribe_via_litellm(cl, msg) -> dict:
         return _too_large_for_groq(size, limit)
 
     file_attr = getattr(msg, "file", None)
-    ext = (getattr(file_attr, "ext", None) or ".oga").lstrip(".")
+    ext = (getattr(file_attr, "ext", None) or ".oga").lstrip(".").lower()
     mime = getattr(file_attr, "mime_type", None) or "audio/ogg"
+    # Telegram names voice notes .oga. The speech API accepts ogg, not oga.
+    if ext == "oga":
+        ext = "ogg"
+        mime = "audio/ogg"
 
     try:
         async with httpx.AsyncClient(timeout=90.0) as client:
@@ -446,12 +450,16 @@ async def _transcribe_via_litellm(cl, msg) -> dict:
                 headers={"Authorization": f"Bearer {api_key}"},
                 data={
                     "model": model,
-                    "response_format": "json",
                     "prompt": "Telegram voice note. Russian, Portuguese, or English.",
                 },
                 files={"file": (f"voice.{ext}", bytes(data), mime)},
             )
-        resp.raise_for_status()
+        if resp.status_code >= 400:
+            detail = " ".join(resp.text.split())[:240]
+            return {
+                "status": "error",
+                "error": f"litellm request failed: HTTP {resp.status_code} {detail}",
+            }
         payload = resp.json()
     except Exception as e:
         return {"status": "error", "error": f"litellm request failed: {e}"}
